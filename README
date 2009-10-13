@@ -74,6 +74,17 @@ somewhat similar to a real web cluster.
 You can also specify the equivalent of an apache MaxClients, which allows you
 to properly test perlbal or similar load balancer.
 
+The real *power* of this software comes in its ability to quickly define
+various cluster scenarios. If you look through the examples/ directory, you'll
+find a very quick way of testing ideal conditions, and any mix of servers you
+can come up with. Fast/slow servers, servers which handle different requests.
+See how your load balancing setup handles having a few broken tarpitting
+machines. Or if you can really roll out those new ultra-fast webservers along
+with your old, slow ones.
+
+It doesn't have anything in the way of collecting server side statistics.
+Could certainly be added in the future.
+
 If you think this stuff is useful, have a patch or idea, or want to say
 thanks or how much you hate me, feel free to shoot me an e-mail :) If there's
 interest, or if I continue to use the software, I'll continue to make
