@@ -1,0 +1,48 @@
+# Cluster where half of the servers are old, and half are new.
+requests:
+    normal:
+        name: "normal request"
+        url: "/normal"
+        ticks: 400
+        size: 5000
+    fast:
+        name: "immediate response"
+        url: "/fast"
+        ticks: 0
+        size: 500
+
+servers:
+    new:
+        name: "new webserver"
+        cpu_count: 4
+        cpu_speed: 4000
+        max_conns: 8
+        listen_queue: 5
+        keep_alive: 1
+    old:
+        name: "old webserver"
+        cpu_count: 4
+        cpu_speed: 2000
+        max_conns: 8
+        listen_queue: 5
+        keep_alive: 1
+
+clusters:
+    new:
+        name: "new cluster"
+        port_start: 5000
+        ip: "127.0.0.1"
+        total: 5
+        server_type: "new"
+        requests:
+            - "normal"
+            - "fast"
+    old:
+        name: "old cluster"
+        port_start: 5005
+        ip: "127.0.0.1"
+        total: 5
+        server_type: "old"
+        requests:
+            - "normal"
+            - "fast"

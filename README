@@ -1,0 +1,82 @@
+Load balancer test cluster emulator
+Copyright 2009 Dormando (dormando@rydia.net)
+
+Pre-CPAN release of some quick test cluster software I wrote for a talk at
+Velocity 2009.
+
+Dependencies:
+
+Danga::Socket (though future releases might switch to AnyEvent)
+
+To start
+========
+
+$ ./lbemu examples/ideal-test.yaml 
+initialized "basic webserver" listener on 127.0.0.1:5000
+initialized "basic webserver" listener on 127.0.0.1:5001
+initialized "basic webserver" listener on 127.0.0.1:5002
+initialized "basic webserver" listener on 127.0.0.1:5003
+initialized "basic webserver" listener on 127.0.0.1:5004
+initialized "basic webserver" listener on 127.0.0.1:5005
+initialized "basic webserver" listener on 127.0.0.1:5006
+initialized "basic webserver" listener on 127.0.0.1:5007
+initialized "basic webserver" listener on 127.0.0.1:5008
+initialized "basic webserver" listener on 127.0.0.1:5009
+
+Look in examples/ directory for a few examples.
+
+HTTP parsing is _ultra_ simple. It supports an 'OPTIONS *' command, and a GET
+vs any configured URL's. No other processing is done. Responses consist of 'x'
+characters up to the requested response length.
+
+It's pretty fast. Disabling the scheduling algorithm I can get over 10,000
+requests/sec on my laptop. With the algo it's a lot lower but still pretty
+good. A big point with this software is not to push a huge volume of requests
+through it, however.
+
+What lbemu is
+=============
+
+lbemu is a no-frills web cluster emulator. It allows you to create fake
+webservers listening on many IPs or ports, which you can then configure into
+your load balancer or proxy. It is useful in tuning paramters on your load
+balancer and for comparing effectiveness of different load balancers, if you
+are evaluating hardware/software solutions.
+
+Lbemu contains a fake even-balanced CPU scheduler in order to emulate how much
+*time* it takes to process a request.
+
+- Specify a machine as having 1-n CPU's (lets say four)
+- Specify each CPU as being able to process n 'ticks' per second (lets say
+  5000)
+- lbemu runs at 50 'frames' per second. This is tunable in the top of your
+  sourcecode if you frequently lag on a loop.
+- Requests are specified as having 0 or more ticks. a 0 tick doesn't enter the
+  scheduler, it's immediately responded to. This is for requests like OPTIONS
+  or a small static file.
+- lbemu attempts to have a request process in that amount of time, per
+  scheduled across the CPUs.
+
+So if you have a request that takes 1000 ticks, with 4 cpus with a 5000 tick
+capacity each, a single request against the server should complete in roughly
+200 milliseconds.
+
+If you issue 4 requests all at once, they should all return in roughly 200
+milliseconds.
+
+If you issue 8 requests all at once, they should all return in roughly 400
+milliseconds. This is what sets lbemu aside as far as lightweight server
+emulation goes; it's not simply taking a request and returning a response
+after N amount of time. Based on the requests presently being processed,
+finished, running in parallel, requests will fluctuate and slow down at least
+somewhat similar to a real web cluster.
+
+You can also specify the equivalent of an apache MaxClients, which allows you
+to properly test perlbal or similar load balancer.
+
+If you think this stuff is useful, have a patch or idea, or want to say
+thanks or how much you hate me, feel free to shoot me an e-mail :) If there's
+interest, or if I continue to use the software, I'll continue to make
+releases.
+
+- Dormando (dormando@rydia.net)

@@ -1,0 +1,32 @@
+# Web cluster with nothing wrong with it
+requests:
+    normal:
+        name: "normal request"
+        url: "/normal"
+        ticks: 400
+        size: 5000
+    fast:
+        name: "immediate response"
+        url: "/fast"
+        ticks: 0
+        size: 500
+
+servers:
+    basic:
+        name: "basic webserver"
+        cpu_count: 4
+        cpu_speed: 4000
+        max_conns: 8
+        listen_queue: 5
+        keep_alive: 1
+
+clusters:
+    main:
+        name: "main cluster"
+        port_start: 5000
+        ip: "127.0.0.1"
+        total: 10
+        server_type: "basic"
+        requests:
+            - "normal"
+            - "fast"

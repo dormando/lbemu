@@ -1,0 +1,504 @@
+#!/usr/bin/perl
+# Copyright 2009 Dormando (dormando@rydia.net)
+# All rights reserved.
+#
+# Use and distribution licensed under the BSD license.  See
+# the LICENSE file for full text.
+
+# Version 0.1
+
+use strict;
+use warnings FATAL => 'all';
+use IO::Socket;
+use Socket;
+use Time::HiRes qw(gettimeofday tv_interval);
+use Data::Dumper qw(Dumper);
+
+use constant FRAMES_PER_SECOND => 50;
+use constant DEBUG => 0;
+
+package Lbemu::Config;
+use YAML qw/LoadFile/;
+use Time::HiRes qw/gettimeofday tv_interval/;
+use fields qw(requests servers clusters config vboxes);
+
+sub new {
+    my $proto = shift;
+    my $class = ref $proto || $proto;
+    my $me = fields::new($class);
+    my %args = @_;
+    $me->{servers}  = {};
+    $me->{requests} = {};
+    $me->{clusters} = {};
+    $me->{config}   = {};
+    if ($args{Config}) {
+        $me->load_config($args{Config});
+    }
+    return $me;
+}
+
+sub load_config {
+    my $self = shift;
+    my $y = LoadFile($_[0]);
+    die "Could not parse logfile $_[0]" unless $y;
+
+    $self->{config} = $y;
+
+    $self->parse_config($y);
+    return 1;
+}
+
+# create a sack of listeners as described in the file.
+sub parse_config {
+    my $self = shift;
+    my $conf = shift;
+
+    for my $request (keys %{$conf->{requests}}) {
+        $self->{requests}->{$request} =
+            $self->_make_request($conf->{requests}->{$request});
+    }
+
+    for my $server (keys %{$conf->{servers}}) {
+        $self->{servers}->{$server} =
+            $self->_make_server($conf->{servers}->{$server});
+    }
+
+    # for each cluster, generate server objects.
+    # for each server object created, iterate requests.
+    # use request object? pass back into server.
+    # set listener for server object.
+    for my $cname (keys %{$conf->{clusters}}) {
+        my $c = $conf->{clusters}->{$cname};
+        my $s;       # reference to the server config.
+        my $counter; # offset for incrementing port or IP.
+        my $ip;      # stubbed prefix for the IP address.
+        unless ($s = $self->{servers}->{$c->{server_type}}) {
+            die "unknown or invalid server type: "
+                . $c->{server_type};
+        }
+        if ($c->{ip_start}) {
+            ($ip, $counter) = ($c->{ip_start} =~ m/(\d+\.\d+\.\d+\.)(\d+)/);
+            if ($counter + $c->{total} > 254) {
+                die "cannot extend cluster IP past 254. add fewer servers or"
+                   ." reduce the final IP digit.";
+            }
+        } elsif ($c->{port_start}) {
+            $counter = $c->{port_start};
+        } else {
+            die "cluster needs at least ip_start or port_start configured";
+        }
+
+        for my $offset (0 .. $c->{total} - 1) {
+            my $hostport;
+            if ($c->{ip_start}) {
+                $hostport = $ip . ($counter + $offset) . ':' . $c->{port};
+            } elsif ($c->{port_start}) {
+                $hostport = $c->{ip} . ':' . ($counter + $offset);
+            }
+            my $reqs = {};
+            for my $r (@{$c->{requests}}) {
+                $reqs->{$r} = $self->{requests}->{$r};
+            }
+            my $vbox = Lbemu::Listener->new(server => $s,
+                        hostport => $hostport, requests => $reqs);
+            push(@{$self->{vboxes}}, $vbox);
+        }
+    }
+}
+
+sub run_servers {
+    my $self = shift;
+    my $start = [gettimeofday];
+    for my $vbox (@{$self->{vboxes}}) {
+        $vbox->run_requests;
+    }
+    my $end     = [gettimeofday];
+    my $tosleep = (1 / main::FRAMES_PER_SECOND) - 
+                  tv_interval($start, $end);
+#    print tv_interval($start, $end), "\n";
+    if ($tosleep < 0) {
+        $tosleep = 0;
+        print "overran frame timer.\n";
+    }
+
+    Danga::Socket->AddTimer($tosleep, sub { $self->run_servers });
+}
+
+# Fill out the rest of the fields.
+# mostly the boilerplate response.
+# flatly pre-generate the responses into single streams means
+# we do less processing at response time.
+sub _make_request {
+    my $self = shift;
+    my $req  = shift;
+
+    my $resp = "HTTP/1.0 200 OK\r\n"
+              ."Server: Lbemu\r\n"
+              ."Content-Length: " . $req->{size} . "\r\n"
+              ."Connection: close\r\n"
+              ."KEEP\r\n"
+              ."ALIVE\r\n"
+              ."Content-Type: text/plain\r\n"
+              ."\r\n"
+              . 'x' x $req->{size};
+    $req->{resp} = $resp;
+    $req->{resp} =~ s/KEEP\r\n//;
+    $req->{resp} =~ s/ALIVE\r\n//;
+    $resp =~ s/Connection: close\r\n//;
+    $resp =~ s/KEEP/Keep-Alive: timeout=30, max=100/;
+    $resp =~ s/ALIVE/Connection: keep-alive/;
+    $req->{resp_keepalive} = $resp;
+
+    return $req;
+}
+
+# Nothing to preprocess yet, but stubbed for yucks.
+sub _make_server {
+    my $self  = shift;
+    my $serv  = shift;
+
+    return $serv;
+}
+
+# Creates a web cluster of servers that handle requests
+# requests can be defined externally to web clusters.
+
+# TODO: store what server this is, pass server instance reference
+# to clients.
+package Lbemu::Listener;
+use Danga::Socket;
+use base qw(Danga::Socket);
+use fields (qw(server listener hostport state queue requests req_list clients ticks_per));
+
+sub new {
+    my Lbemu::Listener $self = shift;
+    $self = fields::new($self) unless ref $self;
+
+    my %args = @_;
+
+    my $s = $args{server};
+    my $listener = IO::Socket::INET->new(LocalAddr => $args{hostport},
+                                         Proto => Socket::IPPROTO_TCP,
+                                         Listen => $s->{listen_queue},
+                                         ReuseAddr => 1,
+                                        );
+    die "Error creating listener: $!" unless $listener;
+    $listener->blocking(0) or die "Can't set nonblock for $args{hostport}: $!";
+    $self->SUPER::new($listener);
+
+    $self->{requests} = {};
+    $self->_setup_requests($args{requests});
+    $self->{req_list} = $args{requests}; # for dumping if need be.
+    $self->{server}   = $s;
+    $self->{hostport} = $args{hostport};
+    $self->{listener} = $listener;
+    $self->{clients}  = {};
+    $self->{queue}    = [];
+    $self->{ticks_per} = $s->{cpu_speed} / main::FRAMES_PER_SECOND;
+    $self->watch_read(1);
+    print "initialized \"$s->{name}\" listener on $args{hostport}\n";
+    return $self;
+}
+
+# Run through queue of requests, apply algorithm.
+# [ $c, $r, $ticks_left ]
+# algo is:
+# - split the list by number of CPU's
+# - for each list, divide $ticks_per by size of list
+# - per queued request, apply available ticks to ticks_left
+# - if ticks_left < 0, add abs($ticks_left) to $remainder
+# - if request is completed, send response
+# - zero out the array entry for a completed request
+# - if $remainder > 10, set $ticks_avail to $remainder
+# - jump back above the loop and re-run that CPU if there are reqs left
+# - once out of CPUs, init a new array and @new = grep { $_ } @old
+# - replace queue with new array
+sub run_requests {
+    my $self = shift;
+    my $s = $self->{server};
+
+    my $queue     = $self->{queue};
+    my $ticks_per = $self->{ticks_per};
+    my $qsize     = scalar @$queue;
+    return unless $qsize;
+
+    # Drive this value forward to iterate over CPUs.
+    my $ticks_avail = 0;
+    my $remaining   = 0;
+    my @r_per_cpu = ();
+    my $r_index = 0;
+    for (1 .. $qsize) {
+        $r_per_cpu[$r_index++]++;
+        $r_index = 0 if $r_index > $s->{cpu_count} - 1;
+    }
+
+    my $start = 0;
+    for (my $cpu_offset = 0; $cpu_offset < $s->{cpu_count}; $cpu_offset++) {
+        $ticks_avail = $ticks_per unless $ticks_avail;
+        $remaining   = 0;
+        # If we go through the below loop without running anything,
+        # the CPU is out of stuff to do.
+        my $ran = 0;
+        my $r_on_cpu = $r_per_cpu[$cpu_offset] || 0;
+        for (my $offset = $start; $offset < $start + $r_on_cpu; $offset++) {
+            print "cpu: $cpu_offset\n" if main::DEBUG > 1;
+            my $r = $queue->[$offset];
+            next unless $r;
+            my $ticks_touse = int($ticks_per / $r_on_cpu);
+            $ticks_touse    = 1 unless $ticks_touse;
+            $ticks_avail   -= $ticks_touse;
+            $ticks_touse   -= abs($ticks_avail) if ($ticks_avail < 0);
+            $r->[2]        -= $ticks_touse if $ticks_touse > 0;
+            $remaining     += abs($r->[2]) if ($r->[2] < 0);
+            print "offset: $offset ticks: $r->[2]\n" if main::DEBUG > 1;
+            if ($r->[2] < 1) {
+                $self->send_response($r);
+                $queue->[$offset] = 0;
+            }
+            $ran++;
+        }
+        $remaining += $ticks_avail if ($ticks_avail > 0);
+        # 10 is a fudge number.
+        if ($remaining > 10 && $ran) {
+            $ticks_avail = $remaining;
+            redo;
+        } else {
+            $ticks_avail = 0;
+            $start += $r_on_cpu;
+        }
+    }
+
+    # filter out completed requests.
+    my @new_queue  = grep { $_ } @$queue;
+    $self->{queue} = \@new_queue;
+}
+
+# turn us into the real request map.
+sub _setup_requests {
+    my $self = shift;
+    my $reqs = shift;
+
+    for my $r (values %{$reqs}) {
+        $self->{requests}->{$r->{url}} = $r;
+    }
+}
+
+# Client accept routine.
+sub event_read {
+    my Lbemu::Listener $self = shift;
+
+    while (my ($sock, $peer) = $self->{listener}->accept) {
+        $sock->blocking(0);
+        print "initiating new client conn\n" if main::DEBUG > 0;
+        my $client = Lbemu::Socket->new(sock => $sock, owner => $self);
+        $self->{clients}->{$client}++;
+        if (scalar keys %{$self->{clients}} >= $self->{server}->{max_conns}) {
+            print "suspending accepts\n" if main::DEBUG > 0;
+            $self->watch_read(0);
+            last;
+        }
+    }
+}
+
+# Track stats?
+sub remove_client {
+    my Lbemu::Listener $self = shift;
+    my $client = shift;
+    delete $self->{clients}->{$client};
+    print "closed off a client: " . scalar(keys %{$self->{clients}}) . "\n"
+        if main::DEBUG > 0;
+    $self->watch_read(1);
+}
+
+# Stick a request into the run queue.
+# If request requires 0 ticks to satisfy, immediately return response.
+# If more, init a structure, put into queue, and wait for the algo pass.
+# Queued items are arrays for speed: fast access to the item count, and
+# fast access to the state for applying the algo.
+sub run_request {
+    my $self = shift;
+    my $req  = shift;
+    my $c    = shift;
+    my $k    = shift;
+
+    if ($req->{ticks} != 0) {
+        push(@{$self->{queue}}, [ $c, $req, $req->{ticks}, $k ]);
+    } else {
+        # return immediately.
+        $self->send_response([ $c, $req, $req->{ticks}, $k ]);
+    }
+}
+
+# [ $c, $req, $ticks_left, $do_keepalive ]
+sub send_response {
+    my $self = shift;
+    my $req  = shift;
+
+    my $resp;
+    my $keep_alive = $self->{server}->{keep_alive};
+    if ($keep_alive && $req->[3]) {
+        $resp = \$req->[1]->{resp_keepalive};
+    } else {
+        $resp = \$req->[1]->{resp};
+    }
+    my $c = $req->[0];
+    $c->write($resp);
+    $c->write(sub { $c->sent_response($keep_alive && $req->[3]) });
+}
+
+# Client connections.
+package Lbemu::Socket;
+use Danga::Socket;
+use base 'Danga::Socket';
+use fields (qw(conn owner reqbuf options_request));
+
+sub new {
+    my Lbemu::Socket $self = shift;
+
+    $self = fields::new($self) unless ref $self;
+    my %args = @_;
+    $self->SUPER::new($args{sock});
+    $self->{conn}   = $args{sock};
+    $self->{owner}  = $args{owner};
+    $self->{reqbuf} = '';
+    $self->watch_read(1);
+
+    $self->{options_request} = {
+        name  => "options request",
+        url   => "*",
+        ticks => 0,
+        size  => 0,
+        resp  => "HTTP/1.0 200 OK\r\n"
+                ."Server: Lbemu\r\n"
+                ."Allow: GET,HEAD,POST,OPTIONS\r\n"
+                ."Content-Length: 0\r\n"
+                ."Connection: close\r\n"
+                ."Content-Type: text/plain\r\n\r\n",
+        resp_keepalive  => "HTTP/1.0 200 OK\r\n"
+                ."Server: Lbemu\r\n"
+                ."Allow: GET,HEAD,POST,OPTIONS\r\n"
+                ."Content-Length: 0\r\n"
+                ."Keep-Alive: timeout=15, max=600\r\n"
+                ."Connection: Keep-Alive\r\n"
+                ."Content-Type: text/plain\r\n\r\n",
+    };
+
+    return $self;
+}
+
+# $_[0] == $keep_alive
+sub sent_response {
+    my $self       = shift;
+    unless ($_[0]) {
+        my $junk = $self->read(5);
+        $self->close("no_keep_alive");
+        return 0;
+    }
+}
+
+sub _parse_request {
+    my $self = shift;
+    my $headers = $self->{reqbuf};
+    my $r;
+
+    # When parsing, we only care about the first line.
+    $self->{reqbuf} = '';
+    my $req = substr($headers, 0, index($headers, "\r\n"));
+    unless ($req) {
+        print "no newline in buffer?\n";
+        return 0;
+    }
+
+    my $path;
+    if ($req =~ m/^GET (\S+) HTTP/) {
+        $path = $1;
+    } elsif ($req =~ m/OPTIONS \* HTTP/) {
+        $r = $self->{options_request};
+    } else {
+        print "invalid line received: $req\n";
+        return 0;
+    }
+    my $owner = $self->{owner};
+    # VIOLATING object interface for speed.
+    # replace this if profile shows it doesn't matter.
+    $r = $owner->{requests}->{$path} unless $r;
+    if ($r) {
+        my $do_keepalive =
+            index(lc($headers), "connection: keep-alive") > -1 ? 1 : 0;
+        $owner->run_request($r, $self, $do_keepalive);
+        #$self->write("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\ntoast");
+    } else {
+        # Not handled, return a canned 404.
+        # TODO: Actually do this :P
+        print "404\n";
+        return 0;
+    }
+
+    return 1;
+}
+
+sub event_write {
+    my Lbemu::Socket $self = shift;
+    $self->watch_write(0) if $self->write(undef);
+}
+
+# TODO: Buffer a full header's request, then run the internal call to parse..
+# ignore any headers beyond the GET line, but wait until we have a \r\n\r\n
+# before passing to parser.
+sub event_read {
+    my Lbemu::Socket $self = shift;
+    my $buf = $self->read(1024 * 1024);
+    if ($buf) {
+        $self->{reqbuf} .= $$buf;
+        print "total buffer: " . $self->{reqbuf} . "END\n" if main::DEBUG > 1;
+        if (index($self->{reqbuf}, "\r\n\r\n") > -1) {
+            unless ($self->_parse_request()) {
+                # Indicating a failure without an eval/die.
+                # Just assuming this works better for speed.
+                $self->close(@_);
+            }
+        }
+    } else {
+        return if $self->{closed};
+        $self->close(@_);
+    }
+}
+
+sub event_err {
+    my Lbemu::Socket $self = shift;
+    print "something go boom\n";
+    $self->close("error");
+}
+
+sub event_hup {
+    my Lbemu::Socket $self = shift;
+    $self->close("after_hup");
+}
+
+sub close {
+    my $self = shift;
+    $self->SUPER::close(@_);
+    $self->{owner}->remove_client($self);
+}
+
+# As generic as need be?
+# can use objects for a bunch of it, I guess? just use fast internal storage.
+
+package main;
+
+$|++;
+# Main runloop...
+# TODO: parent/child management code. Scale out the CPU burn.
+
+# init a configuration object
+# init an object for the generic listener (pass in config object)
+# "start" on the listener.
+# should never return. expand for multiprocessing later.
+
+my $conf = Lbemu::Config->new(Config => $ARGV[0]);
+# kick off the timer... I don't think it belongs in the config object
+# but that's where we're keeping the list.
+$conf->run_servers;
+Danga::Socket->SetLoopTimeout(1000);
+# Add any post-loop callbacks here?
+Danga::Socket->EventLoop();
